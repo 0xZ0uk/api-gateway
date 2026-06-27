@@ -21,8 +21,8 @@ import {
   extractApiToken,
   getStickyModel,
   setStickyModel,
-  logRequest,
 } from './proxy.js';
+import { logRequest } from '../lib/request-log.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { attachClientAbort, isAbortError } from '../lib/abort.js';
 import { getGlobalRetryLimit } from '../services/router.js';

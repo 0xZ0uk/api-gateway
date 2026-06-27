@@ -880,3 +880,237 @@ export function hasEnabledToolsModel(): boolean {
   `).get() as { cnt: number };
   return row.cnt > 0;
 }
+
+// ── Fusion support ───────────────────────────────────────────────────────────
+// These functions let the fusion service select a diverse panel of models,
+// pin each panel slot to its model (key-rotation only within the model), and
+// resolve explicit model ids. They share router internals (cooldowns, quotas,
+// key decryption) so fusion panel members are just as reliable as normal requests.
+
+/**
+ * Fetch a single ChainRow by model db id, or null if the model is disabled
+ * or doesn't exist. Used by routePinnedModel to isolate one model's row.
+ */
+function getModelChainRow(db: Database, modelDbId: number): ChainRow | null {
+  return db.prepare(`
+    SELECT fc.model_db_id, fc.priority, fc.enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.size_label, m.monthly_token_budget,
+           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+           m.supports_tools, m.context_window, m.max_output_tokens, m.key_id
+    FROM fallback_config fc
+    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+    WHERE fc.enabled = 1 AND m.id = ?
+  `).get(modelDbId) as ChainRow | null;
+}
+
+/**
+ * Route to ONE specific model, hard-pinned. Rotates across that model's keys
+ * (cooldowns, quotas, decryption all honored) but NEVER substitutes a different
+ * model — returns null if the pinned model can't serve right now. This is what
+ * makes a fusion panel genuinely diverse: a rate-limited slot is dropped, not
+ * silently collapsed onto whatever else is available. `skipKeys` lets a slot
+ * exclude keys it already failed on this request.
+ */
+export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skipKeys?: Set<string>): RouteResult | null {
+  const db = getDb();
+  const entry = getModelChainRow(db, modelDbId);
+  if (!entry) return null;
+  if (entry.context_window != null && estimatedTokens > entry.context_window) return null;
+  if (entry.tpm_limit != null && estimatedTokens > entry.tpm_limit) return null;
+  return selectKeyForModel(entry, estimatedTokens, skipKeys);
+}
+
+/**
+ * Select a working key for a single model, returning the full RouteResult or
+ * null if none of the model's keys can serve right now. All rate-limit and
+ * cooldown checks apply — no aggressive fallback to exhausted keys.
+ */
+function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>): RouteResult | null {
+  const db = getDb();
+
+  // Build provider instance
+  const provider = buildProviderFor(entry.platform);
+  if (!provider) return null;
+
+  // Get enabled healthy keys for this platform
+  const keys = db.prepare(
+    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all(entry.platform) as KeyRow[];
+  if (keys.length === 0) return null;
+
+  // Resolve limits
+  const platformDefaults = db.prepare(
+    `SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit FROM built_in_provider_settings WHERE platform = ?`,
+  ).get(entry.platform) as
+    | { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null }
+    | undefined;
+  const limits = {
+    rpm: entry.rpm_limit ?? platformDefaults?.rpm_limit ?? null,
+    rpd: entry.rpd_limit ?? platformDefaults?.rpd_limit ?? null,
+    tpm: entry.tpm_limit ?? platformDefaults?.tpm_limit ?? null,
+    tpd: entry.tpd_limit ?? platformDefaults?.tpd_limit ?? null,
+  };
+
+  // Filter out exhausted keys
+  const exhaustedOrder = getExhaustedKeysForModel(entry.platform, entry.model_id);
+  const exhaustedIds = new Set(exhaustedOrder.map(e => e.keyId));
+  const keyOrder = keys.filter(k => !exhaustedIds.has(k.id));
+  if (keyOrder.length === 0) return null;
+
+  // Round-robin index
+  const rrKey = `${entry.platform}:${entry.model_id}`;
+  const idx = roundRobinIndex.get(rrKey) ?? 0;
+
+  for (let attempt = 0; attempt < keyOrder.length; attempt++) {
+    const key = keyOrder[(idx + attempt) % keyOrder.length];
+    const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
+    if (skipKeys?.has(skipId)) continue;
+
+    // Rate-limit and cooldown checks
+    if (isOnCooldown(entry.platform, entry.model_id, key.id)) continue;
+    if (!canUseProvider(entry.platform, key.id)) continue;
+    if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) continue;
+    if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) continue;
+
+    // Reserve in-flight slot (parallel request gating)
+    const cp = db.prepare(
+      'SELECT max_parallel_requests FROM custom_providers WHERE slug = ?'
+    ).get(entry.platform) as { max_parallel_requests: number | null } | undefined;
+    const maxPar = cp?.max_parallel_requests ?? null;
+    if (!tryReserveSlot(entry.platform, maxPar)) continue;
+
+    // Decrypt the key
+    let decryptedKey: string;
+    try {
+      decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+    } catch {
+      db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
+        .run(key.id);
+      releaseSlot(entry.platform);
+      continue;
+    }
+
+    // Advance round-robin
+    roundRobinIndex.set(rrKey, idx + attempt + 1);
+
+    const release = () => releaseSlot(entry.platform);
+    return {
+      provider,
+      modelId: entry.model_id,
+      modelDbId: entry.model_db_id,
+      apiKey: decryptedKey,
+      keyId: key.id,
+      platform: entry.platform,
+      displayName: entry.display_name,
+      rpdLimit: limits.rpd,
+      tpdLimit: limits.tpd,
+      maxOutputTokens: entry.max_output_tokens,
+      release,
+    };
+  }
+
+  return null;
+}
+
+// A panel candidate surfaced to the fusion layer: enough to pick a diverse set
+// and resolve each to a pinned dispatch.
+export interface FusionCandidate {
+  modelDbId: number;
+  platform: string;
+  modelId: string;
+  displayName: string;
+  sizeLabel: string;
+  supportsVision: number;
+  supportsTools: number;
+}
+
+/**
+ * The active fallback chain ordered by the current routing strategy, surfaced
+ * for fusion panel selection. Same ordering the normal auto-router would walk,
+ * so the panel's auto-pick draws from the highest-scored models first and the
+ * fusion layer just needs to apply provider-diversity on top.
+ */
+export function getOrderedFusionChain(): FusionCandidate[] {
+  const db = getDb();
+  const strategy = getRoutingStrategy();
+  if (strategy !== 'priority') refreshStatsCache(db);
+
+  const chain = db.prepare(`
+    SELECT fc.model_db_id, fc.priority, fc.enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.size_label, m.monthly_token_budget,
+           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+           m.supports_tools, m.context_window, m.max_output_tokens, m.key_id
+    FROM fallback_config fc
+    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+    WHERE fc.enabled = 1
+  `).all() as ChainRow[];
+
+  // Only consider models that can be served right now
+  const usableKeys = db.prepare(
+    "SELECT id, platform FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all() as { id: number; platform: string }[];
+  const keysByPlatform = new Map<string, number[]>();
+  for (const k of usableKeys) {
+    const arr = keysByPlatform.get(k.platform);
+    if (arr) arr.push(k.id); else keysByPlatform.set(k.platform, [k.id]);
+  }
+
+  const servable = chain.filter(e => {
+    const keyIds = keysByPlatform.get(e.platform);
+    if (!keyIds) return false;
+    const limits = { rpm: e.rpm_limit, rpd: e.rpd_limit, tpm: e.tpm_limit, tpd: e.tpd_limit };
+    return keyIds.some(kid =>
+      (e.key_id == null || kid === e.key_id) &&
+      !isOnCooldown(e.platform, e.model_id, kid) &&
+      canUseProvider(e.platform, kid) &&
+      canMakeRequest(e.platform, e.model_id, kid, limits),
+    );
+  });
+
+  const ordered = orderChain(servable, strategy);
+  return ordered.map(e => ({
+    modelDbId: e.model_db_id,
+    platform: e.platform,
+    modelId: e.model_id,
+    displayName: e.display_name,
+    sizeLabel: e.size_label,
+    supportsVision: e.supports_vision,
+    supportsTools: e.supports_tools,
+  }));
+}
+
+/**
+ * Resolve an explicit model id to a fusion candidate, or null when it isn't a
+ * known enabled model. Prefers an enabled row; dedupes a model id that exists
+ * on multiple platforms by intelligence rank.
+ */
+export function resolveFusionCandidate(modelId: string): FusionCandidate | null {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name,
+           m.size_label, m.supports_vision, m.supports_tools
+    FROM models m
+    WHERE m.model_id = ? AND m.enabled = 1
+    ORDER BY m.intelligence_rank ASC, m.id ASC
+    LIMIT 1
+  `).get(modelId) as {
+    model_db_id: number; platform: string; model_id: string; display_name: string;
+    size_label: string; supports_vision: number; supports_tools: number;
+  } | undefined;
+
+  if (row) {
+    return {
+      modelDbId: row.model_db_id,
+      platform: row.platform,
+      modelId: row.model_id,
+      displayName: row.display_name,
+      sizeLabel: row.size_label,
+      supportsVision: row.supports_vision,
+      supportsTools: row.supports_tools,
+    };
+  }
+
+  return null;
+}

@@ -16,6 +16,8 @@ import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
+import { logRequest } from '../lib/request-log.js';
+import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
 
 export const proxyRouter = Router();
 
@@ -425,6 +427,9 @@ const chatCompletionSchema = z.object({
   // into the wire shape each upstream accepts. (#290)
   reasoning_effort: thinkingEffortSchema.nullable().optional(),
   thinking: thinkingConfigSchema.nullable().optional(),
+  // Fusion config — only meaningful when `model` is the virtual "fusion" id.
+  // Ignored for every other model. See services/fusion.ts.
+  fusion: fusionConfigSchema.optional(),
 });
 export function isRetryableError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
@@ -723,6 +728,82 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         code: 'no_tools_model',
       },
     });
+    return;
+  }
+
+  // ── Fusion: multi-model synthesis ──────────────────────────────────────────
+  // The virtual \"fusion\" model fans the prompt out to a panel of diverse models
+  // in parallel, then a judge synthesizes one answer. It routes each panel/judge
+  // sub-call through the normal path (cooldowns, quotas, analytics), so it
+  // behaves like a normal model from the client's side — just K+1x the tokens.
+  // v1 has no tools/vision; reject those up front and replay the synthesized
+  // answer as a single SSE turn when stream is set.
+  if (isFusionModel(requestedModel)) {
+    if (hasImage) {
+      res.status(422).json({ error: { message: 'Fusion does not support image input yet. Use a vision model directly.', type: 'invalid_request_error', code: 'fusion_no_vision' } });
+      return;
+    }
+    if (wantsTools) {
+      res.status(422).json({ error: { message: 'Fusion does not support tool calling yet. Use a tool-capable model directly.', type: 'invalid_request_error', code: 'fusion_no_tools' } });
+      return;
+    }
+    const fusionOptions = { temperature, max_tokens, top_p };
+    const fusionConfig = parsed.data.fusion ?? {};
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const writeFrame = (o: unknown) => { try { res.write(`data: ${JSON.stringify(o)}\n\n`); } catch { /* socket gone */ } };
+      const streamId = `fusion-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const base = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: FUSION_MODEL_ID };
+      let answerStarted = false;
+      try {
+        const { response } = await runFusion({
+          messages,
+          config: fusionConfig,
+          options: fusionOptions,
+          estimatedTokens: estimatedTotal,
+          hooks: {
+            onPanel: (a) => writeFrame({ _fusion: { event: 'panel', ...a } }),
+            onJudge: (j) => writeFrame({ _fusion: { event: 'judge', ...j } }),
+            onJudgeDelta: (delta) => {
+              if (!answerStarted) { writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }); answerStarted = true; }
+              writeFrame({ ...base, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] });
+            },
+          },
+        });
+        if (!answerStarted) {
+          const finalText = contentToString(response.choices[0]?.message?.content ?? '');
+          writeFrame({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+          writeFrame({ ...base, choices: [{ index: 0, delta: { content: finalText }, finish_reason: null }] });
+        }
+        writeFrame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: response.usage });
+      } catch (err: any) {
+        const message = err instanceof FusionError ? err.message : `fusion error: ${sanitizeProviderErrorMessage(err?.message)}`;
+        const type = err instanceof FusionError && err.status === 429 ? 'rate_limit_error' : 'server_error';
+        writeFrame({ error: { message, type } });
+      }
+      try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
+      return;
+    }
+
+    try {
+      const { response, routedVia } = await runFusion({
+        messages,
+        config: fusionConfig,
+        options: fusionOptions,
+        estimatedTokens: estimatedTotal,
+      });
+      res.setHeader('X-Routed-Via', routedVia);
+      res.json(response);
+    } catch (err: any) {
+      if (err instanceof FusionError) {
+        res.status(err.status).json({ error: { message: err.message, type: err.status === 429 ? 'rate_limit_error' : 'invalid_request_error' } });
+      } else {
+        res.status(502).json({ error: { message: `fusion error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'server_error' } });
+      }
+    }
     return;
   }
 
@@ -1526,29 +1607,3 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
   // Unreachable — the outer loop exits via the 1-RPM limit check above.
 });
-
-export function logRequest(
-  platform: string,
-  modelId: string,
-  keyId: number,
-  status: string,
-  inputTokens: number,
-  outputTokens: number,
-  latencyMs: number,
-  error: string | null,
-  ttfbMs: number | null = null,
-  // The model id the client pinned; null for auto-routed requests. Lets
-  // analytics split pinned vs auto traffic and detect failover overrides
-  // (requested_model set but != model_id).
-  requestedModel: string | null = null,
-) {
-  try {
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel);
-  } catch (e) {
-    console.error('Failed to log request:', e);
-  }
-}

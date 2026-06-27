@@ -6,7 +6,7 @@ import { syncModelsFromProvider } from './custom.js';
 
 export const modelsRouter = Router();
 
-// List all models with availability info
+// List all models with availability info, including the virtual fusion model
 modelsRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
   const models = db.prepare(`
@@ -49,6 +49,31 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     hasProvider: hasProvider(m.platform),
     keyCount: keyCountMap.get(m.platform) ?? 0,
   }));
+
+  // Append the virtual fusion model so clients can discover it.
+  result.push({
+    id: -1,
+    platform: 'fusion' as const,
+    modelId: 'fusion',
+    displayName: 'Fusion (multi-model synthesis)',
+    intelligenceRank: 0,
+    speedRank: 0,
+    sizeLabel: 'Fusion',
+    rpmLimit: null,
+    rpdLimit: null,
+    tpmLimit: null,
+    tpdLimit: null,
+    monthlyTokenBudget: '0',
+    contextWindow: null,
+    maxOutputTokens: null,
+    enabled: true,
+    supportsVision: false,
+    supportsTools: false,
+    priority: 0,
+    fallbackEnabled: false,
+    hasProvider: false,
+    keyCount: 0,
+  });
 
   res.json(result);
 });

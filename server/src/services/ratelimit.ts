@@ -316,6 +316,12 @@ const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 // on the next 402 after expiry if still unpaid; a restart re-benches on first hit.
 export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
 
+/** Duration to bench a model+key after a 403 Model Access Forbidden error.
+ *  The key is valid (it passed validateKey) but this specific model is
+ *  off-limits to the key's tier — e.g. gpt-4o on GitHub Models' free tier.
+ *  A full-day bench avoids re-hammering every retry. */
+export const MODEL_FORBIDDEN_COOLDOWN_MS = DAY;
+
 /** Compute the cooldown duration for a retryable error. Encapsulates the
  *  payment-required vs transient decision so both the proxy and responses
  *  routers apply the same policy. */
